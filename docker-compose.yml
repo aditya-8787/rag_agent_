@@ -1,0 +1,109 @@
+services:
+  # Postgres with pgvector. It holds the embeddings and answers keyword search
+  # over the same rows, so a chunk and its metadata are written in one
+  # transaction and cannot drift apart. The image is the official Postgres one
+  # with the extension already compiled in; `unaccent` and the text search
+  # configuration are created by the application on startup, since they are
+  # idempotent and nobody has to remember a setup step.
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: rag-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready answers as soon as the server accepts connections, which is
+      # later than the port opening: the entrypoint starts Postgres once to run
+      # the init scripts and restarts it, so an open port is not yet the real
+      # server.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # Session storage. Without it the chat endpoint keeps conversations in the
+  # process that served them, so a second replica would not see them and a
+  # restart would forget them.
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      # Published for development: `rag serve` on the host shares the same
+      # session store and the same rate limit counters as the container.
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # One shot: applies the migrations and exits. The API waits for it to finish
+  # successfully, which is what keeps several replicas from racing to create
+  # the same objects at startup. Applying migrations from inside the
+  # application is the anti-pattern this replaces.
+  migrate:
+    build: .
+    image: rag-agent:local
+    container_name: rag-agent-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-nao-usado-para-migrar}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-rag}@postgres:5432/${POSTGRES_DB:-rag}
+    entrypoint: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    build: .
+    image: rag-agent:local
+    container_name: rag-agent-api
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        # Without service_healthy the application would start before Postgres
+        # accepts connections and fail on the first command.
+        condition: service_healthy
+      migrate:
+        # And without this it would start before the schema exists.
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?defina OPENAI_API_KEY no ambiente ou num arquivo .env}
+      KNOWLEDGE_DOMAIN: ${KNOWLEDGE_DOMAIN:-regulação do mercado de capitais brasileiro (resoluções da CVM)}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-rag}@postgres:5432/${POSTGRES_DB:-rag}
+      SESSION_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      # Optional. Set it and every request needs the X-API-Key header.
+      API_KEY: ${API_KEY:-}
+      # Optional. Compose reads these from your .env; empty means no tracing.
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      # One process serialises requests; a slow question blocks the rest.
+      API_WORKERS: ${API_WORKERS:-4}
+      RATE_LIMIT: ${RATE_LIMIT:-60/minute}
+      # Shared across workers and replicas. Without it each process keeps
+      # its own counters and the ceiling is multiplied by their number.
+      RATE_LIMIT_STORAGE: redis://redis:6379/1
+    volumes:
+      # Read-only: the corpus is an input. Swapping documents needs no rebuild.
+      - ./data:/app/data:ro
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
